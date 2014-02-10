@@ -16,11 +16,8 @@ use std::io::buffered::BufferedReader;
 use std::io::stdin;
 use extra::getopts;
 use std::io::File;
-// use std::run::Process;
-// use std::run::ProcessOptions;
-// use std::libc;
-// extra::future;
-// use std::task::task;
+use std::io::signal::Listener;
+use std::io::signal::Interrupt;
 
 struct Shell {
     cmd_prompt: ~str,
@@ -40,7 +37,7 @@ impl Shell {
         loop {
             print(self.cmd_prompt);
             io::stdio::flush();
-            
+
             let line = stdin.read_line().unwrap();
             let cmd_line = line.trim().to_owned();
             let program = cmd_line.splitn(' ', 1).nth(0).expect("no program");
@@ -48,76 +45,124 @@ impl Shell {
 
             cmd_history.push(cmd_line.clone());
 
-            match args.clone().last() {
-                Some("&") => {
-                    let arg_list: ~[~str] =
-                        args.clone().filter_map(|x| if x != "&" { Some(x.to_owned()) } else { None }).to_owned_vec();
-                    let prog = program.to_owned();
-                    spawn(proc() { run::process_status(prog, arg_list); });
-                    continue;
-                }
-                _ => {}
-            }
-
-            // fix needed: support for command ./zhttpto > zlog.txt &
-            let mut iter = args.clone();
-            match iter.find(|&x| x==">") {
-                Some(">") => {
-                    let mut arg_list: ~[~str] = ~[];
-                    args.clone().advance(|x| if x != ">" { arg_list.push(x.to_owned()); true } else { false });
-                    let buffer = run::process_output(program, arg_list);
-                    let path = &Path::new(iter.next().unwrap());
-                    let output = File::open_mode(path, io::Truncate, io::Write);
-                    match output {
-                        Some(mut file) => file.write(buffer.unwrap().output),
-                        None => fail!("Error: Could not write to file.")
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-
-            // note: ambiguity on stdin redirection
-            let mut iter = args.clone();
-            match iter.find(|&x| x=="<") {
-                Some("<") => {
-                    let mut arg_list: ~[~str] = ~[];
-                    args.clone().advance(|x| if x != "<" { arg_list.push(x.to_owned()); true } else { false });
-                    // let file = File::open(&Path::new(iter.next().unwrap()));
-                    // match file {
-                    //     Some(f) => arg_list.push(f),
-                    //     _ => fail!("Error: File not found")
-                    // }
-                    arg_list.push(iter.next().unwrap().to_owned());
-                    run::process_status(program, arg_list);
-                    continue;
-                }
-                _ => {}
-            }
-
-            let mut iter = args.clone();
-            match iter.find(|&x| x=="|") {
-                Some("|") => {
-                    let mut arg_list: ~[~str] = ~[];
-                    args.clone().advance(|x| if x != "|" { arg_list.push(x.to_owned()); true } else { false });
-                    let buffer = run::process_output(program, arg_list);
-                    let target = iter.next().unwrap();
-                    arg_list = ~[];
-                    iter.advance(|x| if x != "" { arg_list.push(x.to_owned()); true } else { false });
-                    arg_list.push(std::str::from_utf8_owned(buffer.unwrap().output));
-                    run::process_status(target, arg_list);
-                    continue;
-                }
-                _ => {}
-            }
-
             match program {
                 ""      =>  { continue; }
                 "exit"  =>  { return; }
                 "cd"    =>  { self.cd(cmd_line); }
                 "history"    =>  { self.history(cmd_history.clone()); }
-                _       =>  { self.run_cmdline(cmd_line); }
+                _ => {}
             }
+
+            match args.clone().last() {
+                Some("&") => {
+                    spawn(proc() {
+                        let mut listener = Listener::new();
+                        listener.register(Interrupt);
+                        loop {
+                            match listener.port.recv() {
+                                Interrupt => (),
+                                _ => (),
+                            }
+                        }
+                    });
+                    println("found & symbol");
+                    let mut iter = args.clone();
+                    let mut past = ~[];
+                    let mut prog = program;
+                    loop {
+                        let token = iter.next();
+                        let x = token.unwrap();
+                        if x == "&" {
+                            // let prog2 = prog;
+                            // let past2 = past;
+                            // spawn(proc() { run::process_status(prog2, past2) });
+                            break;
+                        }
+                        match x {
+                            "<" => {
+                                let mut arg_list: ~[~str] = past.clone();
+                                arg_list.push(iter.next().unwrap().to_owned());
+                                let buffer = run::process_output(prog, arg_list);
+                                past = ~[];
+                                past.push(std::str::from_utf8_owned(buffer.unwrap().output));
+                                continue;
+                            }
+                            ">" => {
+                                let arg_list: ~[~str] = past.clone();
+                                let buffer = run::process_output(prog, arg_list);
+                                let path = &Path::new(iter.next().unwrap());
+                                let output = File::open_mode(path, io::Truncate, io::Write);
+                                match output {
+                                    Some(mut file) => file.write(buffer.unwrap().output),
+                                    None => fail!("Error: Could not write to file.")
+                                }
+                                continue;
+                            }
+                            "|" => {
+                                println("found | symbol");
+                                let arg_list: ~[~str] = past.clone();
+                                let buffer = run::process_output(prog, arg_list);
+                                past = ~[];
+                                past.push(std::str::from_utf8_owned(buffer.unwrap().output));
+                                prog = iter.next().unwrap();
+                                continue;
+                            }
+                            _ => past.push(x.to_owned())
+                        }
+                    }
+                    continue;
+                }
+                _ => {
+                    let mut iter = args.clone();
+                    let mut past = ~[];
+                    let mut prog = program;
+                    loop {
+                        let token = iter.next();
+                        if token == None {
+                            run::process_status(prog, past);
+                            break;
+                        }
+                        let x = token.unwrap();
+                        match x {
+                            "<" => {
+                                let mut arg_list: ~[~str] = past.clone();
+                                let y = iter.next().unwrap();
+                                print("filename: ");
+                                println(y);
+                                arg_list.push(y.to_owned());
+                                // let buffer = run::process_output(prog, arg_list);
+                                // past = ~[];
+                                // past.push(std::str::from_utf8_owned(buffer.unwrap().output));
+                                continue;
+                            }
+                            ">" => {
+                                let arg_list: ~[~str] = past.clone();
+                                let buffer = run::process_output(prog, arg_list);
+                                let path = &Path::new(iter.next().unwrap());
+                                let output = File::open_mode(path, io::Truncate, io::Write);
+                                match output {
+                                    Some(mut file) => file.write(buffer.unwrap().output),
+                                    None => fail!("Error: Could not write to file.")
+                                }
+                                continue;
+                            }
+                            "|" => {
+                                let arg_list: ~[~str] = past.clone();
+                                let buffer = run::process_output(prog, arg_list);
+                                past = ~[];
+                                let path = &Path::new("temp.txt");
+                                File::create(path).write(buffer.unwrap().output);
+                                past.push(~"temp.txt");
+                                prog = iter.next().unwrap();
+                                continue;
+                            }
+                            _ => past.push(x.to_owned())
+                        }
+                    }
+                    continue;
+                }
+            }
+
         }
     }
     
@@ -133,7 +178,6 @@ impl Shell {
     
         if argv.len() > 1 {
             let path = &Path::new(argv[1]);
-            //println!("path: {}", path.display());
             os::change_dir(path);
         }
     }
@@ -150,6 +194,7 @@ impl Shell {
     
     fn run_cmd(&mut self, program: &str, argv: &[~str]) {
         if self.cmd_exists(program) {
+            println("running command line");
             run::process_status(program, argv);
         } else {
             println!("{:s}: command not found", program);
